@@ -10,12 +10,10 @@ Since I can not find any working script for my headless Sheevaplug / Raspberry P
 ![alt text](https://github.com/haindvn/FShareDownloader/blob/master/screenshot3.JPG)
 
 ## Required packages:
-* Pyhon 3.5+
+* Python 3.8+
 * lxml (for Debian system, please install python3-lxml package, we don't need pip to compile from source)
 * requests
-* get_fshare
-* requests
-* hyper
+* httpx with HTTP/2 support
 * colorama
 * termcolor 
 * tqdm
@@ -23,7 +21,7 @@ Since I can not find any working script for my headless Sheevaplug / Raspberry P
 In short, please run these commands on Debian system to install the neccessary packages
 ```
 $ sudo apt-get install python3-lxml
-$ sudo pip3 install get_fshare requests hyper colorama termcolor tqdm
+$ sudo pip3 install 'httpx[http2]' requests colorama termcolor tqdm
 ```
 
 ## Getting Started / Usage
@@ -53,6 +51,6 @@ Then a folder `XXXXXXXXXX` will be created in `/home/haind/movies` then all file
 
 **Note**: if there are sub-folders in the folder link, **they will be skipped, ONLY FILES IN THE FOLDER WILL BE DOWNLOADED**, the script will not recursively download any sub-folder to avoid uncontrollable linked folders/files. The script will also write down a short text file with some useful information for later reference later. 
 
-All credits goes to [FShare API](https://github.com/tudoanh/get_fshare)
+The current version uses Fshare's web metadata API directly because the old `get_fshare` file metadata endpoint no longer returns reliable JSON.
 
 Enjoy Downloading !!!
