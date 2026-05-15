@@ -299,19 +299,20 @@ def download_folder(url, location):
         f.writelines(f"Sub-Folder count: {sub_folder_count} \n")
 
         
-    print(colored("We found {} file(s) in the link, download them now".format(len(folderList)-sub_folder_count),'yellow'))
+    total_file_count = len(folderList)-sub_folder_count
+    print(colored("We found {} file(s) in the link, download them now".format(total_file_count),'yellow'))
     # loop through whole directory and download
     fileCount = 0
     for fileInfo in folderList:
         if not is_folder(fileInfo['furl']):
-            print(colored('File #{}: '.format(fileCount),'white'),colored('{}'.format(fileInfo['name']),'yellow'))
+            fileCount += 1
+            print(colored('File #{}/{}: '.format(fileCount,total_file_count),'white'),colored('{}'.format(fileInfo['name']),'yellow'))
             try:
                 download_url = service.download(FShare_File_URL+fileInfo['linkcode'])
             except FShareAPIError as e:
                 print(colored('Could not create download link for {}: {}'.format(fileInfo['name'], e),'red'))
                 continue
             download_file(download_url,location,fileInfo['name'])
-            fileCount += 1
     
 def download_file(url, location,filename):
     """
@@ -320,38 +321,42 @@ def download_file(url, location,filename):
     # local_filename = url.split('/')[-1]
     local_filename = filename
     local_filename = no_accent_vietnamese(local_filename)
-    if os.path.exists(location + local_filename):
-        print('Local File Existed ! Ignore downloading')
-        return 1
-    else:
-        try:
-            with requests.get(url, stream=True,timeout=(10,30)) as r:
-                try:
-                    r.raise_for_status()
-                    total_size = int(r.headers.get('content-length') or 0)
-                    if (total_size > (2*1024*1024*1024)):
-                    #File is greater than 2Gb, use bigger chunk size
-                        download_chunk_size = 2*1024*1024
-                    else:
-                        download_chunk_size = 1024*1024
-                    downloaded_chunk = 0
-                    progressbar = tqdm(total=total_size or None,desc="Downloading",ncols=70, unit_scale=True, unit="B")
-                    with open(location + local_filename, 'wb') as f:
-                        for chunk in r.iter_content(chunk_size=download_chunk_size): 
-                            if chunk: # filter out keep-alive new chunks
-                                f.write(chunk)
-                                f.flush()
-                                progressbar.update(len(chunk))
-                                # progressbar.update(float((downloaded_chunk*(download_chunk_size)/total_size)))
-                                # downloaded_chunk += 1
-                        progressbar.close()
-                except HTTPError:
-                    print("HTTP Error")
-            return (location + local_filename)
-        except Timeout:
-            print('Please check Internet connection, the request timed out')
-        except RequestException as e:
-            print('Download failed: {}'.format(e))
+    local_path = location + local_filename
+
+    try:
+        with requests.get(url, stream=True,timeout=(10,30)) as r:
+            try:
+                r.raise_for_status()
+                total_size = int(r.headers.get('content-length') or 0)
+                if os.path.exists(local_path):
+                    if total_size > 0 and os.path.getsize(local_path) == total_size:
+                        print('Local File Existed ! Ignore downloading')
+                        return 1
+                    print('Local file incomplete ! Re-download')
+                    os.remove(local_path)
+                if (total_size > (2*1024*1024*1024)):
+                #File is greater than 2Gb, use bigger chunk size
+                    download_chunk_size = 2*1024*1024
+                else:
+                    download_chunk_size = 1024*1024
+                downloaded_chunk = 0
+                progressbar = tqdm(total=total_size or None,desc="Downloading",ncols=70, unit_scale=True, unit="B")
+                with open(local_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=download_chunk_size):
+                        if chunk: # filter out keep-alive new chunks
+                            f.write(chunk)
+                            f.flush()
+                            progressbar.update(len(chunk))
+                            # progressbar.update(float((downloaded_chunk*(download_chunk_size)/total_size)))
+                            # downloaded_chunk += 1
+                    progressbar.close()
+            except HTTPError:
+                print("HTTP Error")
+        return (location + local_filename)
+    except Timeout:
+        print('Please check Internet connection, the request timed out')
+    except RequestException as e:
+        print('Download failed: {}'.format(e))
         
         
 def is_folder(url):
