@@ -28,6 +28,7 @@ $ sudo pip3 install 'httpx[http2]' requests colorama termcolor tqdm
 
 * Download / clone or fork this repo
 * Update `credentials.ini` with your `FShare username` / `password`
+* For full-speed web downloads, export cookies from a logged-in `www.fshare.vn` browser session and set `cookie_file` in `credentials.ini`. When `cookie_file` is set, `username` and `password` are optional.
 * Download file or whole folder from FShare by running this command
 ```
 python3 fdownload.py <file or folder URL> <path_to_save>
@@ -49,8 +50,14 @@ $ python3 fdownload.py https://www.fshare.vn/folder/XXXXXXXX /home/haind/movies
 ```
 Then a folder `XXXXXXXXXX` will be created in `/home/haind/movies` then all files will be put in `XXXXXXXXXX` (we won't create a folder basing on the folder name as per FShare's folder name since I found folder name with Vietnamese accent will be corrupted or give some ab-normal disk operations later, please change the folder name by yourself)
 
+**Cookie login example**
+```
+cookie_file=/home/haind/www.fshare.vn_cookies.json
+```
+Keep this cookie file private because it contains your logged-in Fshare session.
+
 **Note**: if there are sub-folders in the folder link, **they will be skipped, ONLY FILES IN THE FOLDER WILL BE DOWNLOADED**, the script will not recursively download any sub-folder to avoid uncontrollable linked folders/files. The script will also write down a short text file with some useful information for later reference later. 
 
-The current version uses Fshare's web metadata API directly because the old `get_fshare` file metadata endpoint no longer returns reliable JSON.
+The current version uses Fshare's web metadata API directly because the old `get_fshare` file metadata endpoint no longer returns reliable JSON. If `cookie_file` is configured, download links are created through Fshare's web download flow; otherwise the legacy API download flow is used as a fallback.
 
 Enjoy Downloading !!!

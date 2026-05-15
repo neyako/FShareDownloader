@@ -9,6 +9,7 @@ from requests.exceptions import HTTPError, RequestException, Timeout
 
 import configparser
 import httpx
+import json
 import os
 import sys
 import requests
@@ -51,6 +52,8 @@ class FSAPI:
     def __init__(self, email, password):
         self.email = email
         self.password = password
+        self.cookie_file = None
+        self.web_download = False
         self.token = ""
         self.session_id = ""
         self.api = httpx.Client(
@@ -66,7 +69,16 @@ class FSAPI:
             )
         })
 
+    def use_cookie_file(self, cookie_file):
+        self.cookie_file = os.path.expanduser(cookie_file.strip())
+
     def login(self):
+        if self.cookie_file:
+            self._load_web_cookies(self.cookie_file)
+            self._check_web_login()
+            self.web_download = True
+            return {"code": 200, "msg": "Logged in with web cookies"}
+
         payload = {
             "user_email": self.email,
             "password": self.password,
@@ -84,6 +96,9 @@ class FSAPI:
 
     def download(self, url, password=None):
         url = self.check_valid(url)
+        if self.web_download:
+            return self._web_download(url)
+
         payload = {"token": self.token, "url": url}
         if password:
             payload["password"] = password
@@ -142,6 +157,66 @@ class FSAPI:
             message = data.get("message") or data.get("name") or "Metadata lookup failed"
             raise FShareAPIError(f"{message} ({response.status_code})")
         return data
+
+    def _web_download(self, url):
+        try:
+            response = self.web.get(url, timeout=30)
+            response.raise_for_status()
+        except RequestException as e:
+            raise FShareAPIError(f"Could not open Fshare download page: {e}")
+        form = re.search(r'<form id="form-download".*?</form>', response.text, re.S)
+        if not form:
+            raise FShareAPIError("Could not find Fshare download form. Cookie may be expired.")
+        csrf = re.search(r'name="_csrf-app" value="([^"]+)"', form.group(0))
+        linkcode = re.search(r'name="linkcode" value="([^"]+)"', form.group(0))
+        if not csrf or not linkcode:
+            raise FShareAPIError("Could not read Fshare download form fields")
+
+        payload = {
+            "_csrf-app": csrf.group(1),
+            "linkcode": linkcode.group(1),
+            "ushare": "",
+            "withFcode5": "0",
+        }
+        try:
+            response = self.web.post(
+                f"{FShare_Web_URL}/download/get",
+                data=payload,
+                headers={
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": url,
+                },
+                timeout=30,
+            )
+        except RequestException as e:
+            raise FShareAPIError(f"Could not create web download session: {e}")
+        data = self._requests_json(response, "web download session")
+        if "url" not in data:
+            message = data.get("message") or data.get("errors") or data
+            raise FShareAPIError(f"Could not create web download link: {message}")
+        return data["url"]
+
+    def _load_web_cookies(self, cookie_file):
+        with open(cookie_file) as f:
+            data = json.load(f)
+        cookies = data.get("cookies", data) if isinstance(data, dict) else data
+        if not isinstance(cookies, list):
+            raise FShareAPIError("Cookie file must be a JSON list or contain a cookies list")
+        for cookie in cookies:
+            if "name" not in cookie or "value" not in cookie:
+                continue
+            self.web.cookies.set(
+                cookie["name"],
+                cookie["value"],
+                domain=cookie.get("domain"),
+                path=cookie.get("path", "/"),
+            )
+
+    def _check_web_login(self):
+        response = self.web.get(f"{FShare_Web_URL}/account/profile", timeout=30)
+        response.raise_for_status()
+        if "LoginForm[email]" in response.text or "/site/login" in response.url:
+            raise FShareAPIError("Fshare cookie is expired or not logged in")
 
     def _normalize_item(self, item):
         normalized = dict(item)
@@ -370,11 +445,15 @@ def perform_login(login_credential):
     Perform login and return the status True/False
     """    
     global service
-    service = FSAPI(login_credential['username'],login_credential['password'])
+    service = FSAPI(login_credential.get('username',''),login_credential.get('password',''))
+    if login_credential.get('cookie_file'):
+        service.use_cookie_file(login_credential.get('cookie_file'))
     login_status = True
     try:
+        if not service.cookie_file and (not service.email or not service.password):
+            raise FShareAPIError("Missing username/password or cookie_file")
         service.login()
-    except (KeyError, FShareAPIError, httpx.HTTPError):
+    except (KeyError, FShareAPIError, httpx.HTTPError, requests.RequestException, OSError):
         login_status=False
     return login_status
 
