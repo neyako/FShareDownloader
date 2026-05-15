@@ -8,13 +8,16 @@ from tqdm import tqdm
 from requests.exceptions import HTTPError, RequestException, Timeout
 
 import configparser
+import gc
 import httpx
 import json
 import os
 import sys
 import requests
 import re
-from urllib.parse import parse_qs, urlparse
+import time
+from urllib.parse import parse_qs, urljoin, urlparse
+from requests.adapters import HTTPAdapter
 
 # Requires: httpx[http2] requests colorama termcolor tqdm
 # Debian package: python3-lxml
@@ -33,6 +36,10 @@ Folder_Reference_Filename = "Folder_Information.txt"
 FShare_App_Key = "L2S7R6ZMagggC5wWkQhX2+aDi467PPuftWUMRFSn"
 
 CONFIG_FILE = "credentials.ini"
+TRAFFIC_CHECK_INTERVAL_SECONDS = 10 * 60
+LOW_SPEED_THRESHOLD_BYTES = 256 * 1024
+LOW_SPEED_GRACE_SECONDS = 120
+LOW_SPEED_WINDOW_SECONDS = 60
 
 service=''
 
@@ -54,6 +61,7 @@ class FSAPI:
         self.password = password
         self.cookie_file = None
         self.web_download = False
+        self.download_traffic = None
         self.token = ""
         self.session_id = ""
         self.api = httpx.Client(
@@ -62,11 +70,16 @@ class FSAPI:
             headers={"User-Agent": "okhttp/3.6.0"},
         )
         self.web = requests.Session()
+        adapter = HTTPAdapter(pool_connections=2, pool_maxsize=2, pool_block=True)
+        self.web.mount("https://", adapter)
+        self.web.mount("http://", adapter)
         self.web.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-            )
+            ),
+            "Accept-Encoding": "identity",
+            "Connection": "close",
         })
 
     def use_cookie_file(self, cookie_file):
@@ -167,34 +180,51 @@ class FSAPI:
         form = re.search(r'<form id="form-download".*?</form>', response.text, re.S)
         if not form:
             raise FShareAPIError("Could not find Fshare download form. Cookie may be expired.")
-        csrf = re.search(r'name="_csrf-app" value="([^"]+)"', form.group(0))
-        linkcode = re.search(r'name="linkcode" value="([^"]+)"', form.group(0))
+        form_html = form.group(0)
+        payload = self._form_payload(form_html)
+        csrf = payload.get("_csrf-app")
+        linkcode = payload.get("linkcode") or payload.get("linkcodeDownload")
         if not csrf or not linkcode:
             raise FShareAPIError("Could not read Fshare download form fields")
 
-        payload = {
-            "_csrf-app": csrf.group(1),
-            "linkcode": linkcode.group(1),
-            "ushare": "",
-            "withFcode5": "0",
-        }
+        payload["linkcode"] = linkcode
+        payload.setdefault("ushare", "")
+        payload["withFcode5"] = "0"
+        action = re.search(r'action="([^"]+)"', form_html)
+        download_endpoint = urljoin(FShare_Web_URL, action.group(1)) if action else f"{FShare_Web_URL}/download/get"
+        data = self._post_web_download(download_endpoint, url, payload)
+        if data.get("policydowload") and "url" not in data:
+            payload["slow_download"] = "1"
+            data = self._post_web_download(download_endpoint, url, payload)
+        if "url" not in data:
+            message = data.get("message") or data.get("errors") or data
+            raise FShareAPIError(f"Could not create web download link: {message}")
+        return data["url"]
+
+    def _post_web_download(self, endpoint, referer, payload):
         try:
             response = self.web.post(
-                f"{FShare_Web_URL}/download/get",
+                endpoint,
                 data=payload,
                 headers={
                     "X-Requested-With": "XMLHttpRequest",
-                    "Referer": url,
+                    "Referer": referer,
                 },
                 timeout=30,
             )
         except RequestException as e:
             raise FShareAPIError(f"Could not create web download session: {e}")
-        data = self._requests_json(response, "web download session")
-        if "url" not in data:
-            message = data.get("message") or data.get("errors") or data
-            raise FShareAPIError(f"Could not create web download link: {message}")
-        return data["url"]
+        return self._requests_json(response, "web download session")
+
+    def _form_payload(self, form_html):
+        payload = {}
+        for field in re.finditer(r'<input\b[^>]*>', form_html, re.S):
+            name = re.search(r'\bname="([^"]+)"', field.group(0))
+            if not name:
+                continue
+            value = re.search(r'\bvalue="([^"]*)"', field.group(0))
+            payload[name.group(1)] = value.group(1) if value else ""
+        return payload
 
     def _load_web_cookies(self, cookie_file):
         with open(cookie_file) as f:
@@ -217,6 +247,107 @@ class FSAPI:
         response.raise_for_status()
         if "LoginForm[email]" in response.text or "/site/login" in response.url:
             raise FShareAPIError("Fshare cookie is expired or not logged in")
+
+    def get_download_traffic(self):
+        if not self.web_download:
+            return None
+        response = self.web.get(f"{FShare_Web_URL}/account/inforesource", timeout=30)
+        response.raise_for_status()
+        if "LoginForm[email]" in response.text or "/site/login" in response.url:
+            raise FShareAPIError("Fshare cookie is expired or not logged in")
+        chart = re.search(
+            r"Highcharts\.chart\('container-traffic-download'.*?"
+            r"\['Còn khả dụng',\s*(\d+)\],\s*\['Đã sử dụng',\s*(\d+)\]",
+            response.text,
+            re.S,
+        )
+        if chart:
+            remaining_bytes = int(chart.group(1))
+            used_bytes = int(chart.group(2))
+            total_bytes = used_bytes + remaining_bytes
+            return {
+                "used": self._bytes_to_traffic(used_bytes),
+                "total": self._bytes_to_traffic(total_bytes),
+                "remaining": self._bytes_to_traffic(remaining_bytes),
+                "percent": (used_bytes / total_bytes * 100) if total_bytes else 0,
+                "used_bytes": used_bytes,
+                "total_bytes": total_bytes,
+                "remaining_bytes": remaining_bytes,
+            }
+        match = re.search(
+            r'<li class="mdc-list-item download-traffic"[^>]*>.*?<p>\s*'
+            r'<a[^>]*>.*?</a>\s*([^<]+?)\s*/\s*([^<]+?)\s*</p>.*?'
+            r'scaleX\(([^)]+)\)',
+            response.text,
+            re.S,
+        )
+        if not match:
+            return None
+        used = " ".join(match.group(1).split())
+        total = " ".join(match.group(2).split())
+        ratio = float(match.group(3))
+        return {
+            "used": used,
+            "total": total,
+            "remaining": self._traffic_remaining(used, total),
+            "percent": ratio * 100,
+            "used_bytes": self._traffic_to_bytes(used),
+            "total_bytes": self._traffic_to_bytes(total),
+            "remaining_bytes": self._traffic_remaining_bytes(used, total),
+        }
+
+    def _traffic_remaining(self, used, total):
+        remaining_bytes = self._traffic_remaining_bytes(used, total)
+        if remaining_bytes is None:
+            return None
+        return self._bytes_to_traffic(remaining_bytes)
+
+    def _traffic_remaining_bytes(self, used, total):
+        used_bytes = self._traffic_to_bytes(used)
+        total_bytes = self._traffic_to_bytes(total)
+        if used_bytes is None or total_bytes is None:
+            return None
+        return max(total_bytes - used_bytes, 0)
+
+    def refresh_download_traffic(self):
+        self.download_traffic = self.get_download_traffic()
+        return self.download_traffic
+
+    def apply_download_traffic_usage(self, downloaded_bytes):
+        if not self.download_traffic or "remaining_bytes" not in self.download_traffic:
+            return
+        used_bytes = (self.download_traffic.get("used_bytes") or 0) + downloaded_bytes
+        total_bytes = self.download_traffic.get("total_bytes") or used_bytes
+        remaining_bytes = max(total_bytes - used_bytes, 0)
+        self.download_traffic.update({
+            "used": self._bytes_to_traffic(used_bytes),
+            "total": self._bytes_to_traffic(total_bytes),
+            "remaining": self._bytes_to_traffic(remaining_bytes),
+            "percent": (used_bytes / total_bytes * 100) if total_bytes else 0,
+            "used_bytes": used_bytes,
+            "total_bytes": total_bytes,
+            "remaining_bytes": remaining_bytes,
+        })
+
+    def is_download_traffic_low(self, file_size):
+        if not self.download_traffic or file_size <= 0:
+            return False
+        remaining_bytes = self.download_traffic.get("remaining_bytes")
+        return remaining_bytes is not None and remaining_bytes < file_size
+
+    def _traffic_to_bytes(self, value):
+        match = re.search(r'([\d.]+)\s*([KMGT]?B)', value, re.I)
+        if not match:
+            return None
+        units = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
+        return float(match.group(1)) * units[match.group(2).upper()]
+
+    def _bytes_to_traffic(self, value):
+        for unit in ("TB", "GB", "MB", "KB"):
+            factor = {"KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}[unit]
+            if value >= factor:
+                return "{:.1f} {}".format(value / factor, unit)
+        return "{} B".format(int(value))
 
     def _normalize_item(self, item):
         normalized = dict(item)
@@ -276,6 +407,7 @@ def main():
 
     if login_status:
         print(colored('Logged in successfully!','white'))
+        print_download_traffic()
     else:
         print(colored('Login failed! Please check login credentials in {}'.format(CONFIG_FILE),'white'))
         print(colored('Quit','white'))
@@ -310,12 +442,12 @@ def main():
             exit(1)
         print(colored('File: ','white'),colored('{}'.format(fileInfo['name']),'yellow'))
         # print(f'Saving to {location}')
+        file_url = FShare_File_URL+fileInfo['linkcode']
         try:
-            download_url = service.download(FShare_File_URL+fileInfo['linkcode'])
+            download_file(file_url,location,fileInfo['name'],fileInfo.get('size') or fileInfo.get('file_size'))
         except FShareAPIError as e:
             print(colored('Could not create download link: {}'.format(e),'red'))
             exit(1)
-        download_file(download_url,location,fileInfo['name'])
         print(colored('{} downloaded'.format(fileInfo['name']),'yellow'))
 
     elif is_folder(downloadID):
@@ -383,13 +515,63 @@ def download_folder(url, location):
             fileCount += 1
             print(colored('File #{}/{}: '.format(fileCount,total_file_count),'white'),colored('{}'.format(fileInfo['name']),'yellow'))
             try:
-                download_url = service.download(FShare_File_URL+fileInfo['linkcode'])
+                download_file(FShare_File_URL+fileInfo['linkcode'],location,fileInfo['name'],fileInfo.get('size') or fileInfo.get('file_size'))
             except FShareAPIError as e:
                 print(colored('Could not create download link for {}: {}'.format(fileInfo['name'], e),'red'))
                 continue
-            download_file(download_url,location,fileInfo['name'])
+
+def print_download_traffic():
+    try:
+        traffic = service.refresh_download_traffic()
+    except (FShareAPIError, requests.RequestException):
+        return
+    if not traffic:
+        return
+    remaining = traffic.get("remaining") or "unknown"
+    print(colored('Download traffic today: ', 'white'), colored(
+        '{} / {} used ({:.1f}%), {} remaining'.format(
+            traffic["used"],
+            traffic["total"],
+            traffic["percent"],
+            remaining,
+        ),
+        'yellow',
+    ))
     
-def download_file(url, location,filename):
+def wait_for_download_traffic(file_size, force_wait=False):
+    if not getattr(service, "web_download", False) or file_size <= 0:
+        return
+    while force_wait or service.is_download_traffic_low(file_size):
+        remaining = service.download_traffic.get("remaining") if service.download_traffic else "unknown"
+        print(colored(
+            'Fshare daily traffic low ({} left, need {}). Pausing 10 minutes before checking again.'.format(
+                remaining,
+                service._bytes_to_traffic(file_size),
+            ),
+            'yellow',
+        ))
+        time.sleep(TRAFFIC_CHECK_INTERVAL_SECONDS)
+        force_wait = False
+        try:
+            traffic = service.refresh_download_traffic()
+        except (FShareAPIError, requests.RequestException) as e:
+            print(colored('Could not refresh Fshare traffic: {}'.format(e), 'yellow'))
+            continue
+        finally:
+            service.web.close()
+            gc.collect()
+        if traffic:
+            print(colored('Download traffic now: ', 'white'), colored(
+                '{} / {} used ({:.1f}%), {} remaining'.format(
+                    traffic["used"],
+                    traffic["total"],
+                    traffic["percent"],
+                    traffic["remaining"],
+                ),
+                'yellow',
+            ))
+
+def download_file(file_url, location,filename, expected_size=None):
     """
     Download a particular file from with direct link provided from service payload with download bar
     """
@@ -397,43 +579,153 @@ def download_file(url, location,filename):
     local_filename = filename
     local_filename = no_accent_vietnamese(local_filename)
     local_path = location + local_filename
+    expected_size = normalize_file_size(expected_size)
 
-    try:
-        with requests.get(url, stream=True,timeout=(10,30)) as r:
-            try:
+    if expected_size and os.path.exists(local_path):
+        current_size = os.path.getsize(local_path)
+        if current_size == expected_size:
+            print('Local File Existed ! Ignore downloading')
+            return 1
+        if current_size > 0:
+            print('Local file incomplete ! Resume downloading')
+        else:
+            print('Local file incomplete ! Re-download')
+
+    download_session = service.web if getattr(service, "web_download", False) else requests
+
+    while True:
+        download_url = service.download(file_url)
+        local_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+        resume_from = local_size if expected_size and local_size < expected_size else 0
+        headers = {
+            "Accept-Encoding": "identity",
+            "Connection": "close",
+            "Range": "bytes={}-".format(resume_from),
+        }
+
+        try:
+            with download_session.get(download_url, stream=True, timeout=(10,30), headers=headers) as r:
+                if resume_from > 0 and r.status_code != 206:
+                    print('Server did not resume partial file. Re-download')
+                    os.remove(local_path)
+                    expected_size = 0
+                    resume_from = 0
+                    r.close()
+                    continue
                 r.raise_for_status()
-                total_size = int(r.headers.get('content-length') or 0)
+                total_size = total_size_from_response(r, resume_from)
+                if total_size:
+                    expected_size = total_size
                 if os.path.exists(local_path):
-                    if total_size > 0 and os.path.getsize(local_path) == total_size:
+                    current_size = os.path.getsize(local_path)
+                    if expected_size > 0 and current_size >= expected_size:
                         print('Local File Existed ! Ignore downloading')
                         return 1
-                    print('Local file incomplete ! Re-download')
-                    os.remove(local_path)
+                    if resume_from == 0 and current_size > 0 and expected_size > 0:
+                        r.close()
+                        continue
+                    if current_size > 0:
+                        print('Local file incomplete ! Resume downloading')
+                    elif resume_from == 0:
+                        print('Local file incomplete ! Re-download')
+                remaining_size = expected_size - resume_from if expected_size else 0
+                if getattr(service, "web_download", False) and service.is_download_traffic_low(remaining_size):
+                    r.close()
+                    wait_for_download_traffic(remaining_size)
+                    continue
                 if (total_size > (2*1024*1024*1024)):
                 #File is greater than 2Gb, use bigger chunk size
-                    download_chunk_size = 2*1024*1024
+                    download_chunk_size = 8*1024*1024
                 else:
-                    download_chunk_size = 1024*1024
-                downloaded_chunk = 0
-                progressbar = tqdm(total=total_size or None,desc="Downloading",ncols=70, unit_scale=True, unit="B")
-                with open(local_path, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=download_chunk_size):
-                        if chunk: # filter out keep-alive new chunks
-                            f.write(chunk)
-                            f.flush()
-                            progressbar.update(len(chunk))
-                            # progressbar.update(float((downloaded_chunk*(download_chunk_size)/total_size)))
-                            # downloaded_chunk += 1
+                    download_chunk_size = 4*1024*1024
+                downloaded_bytes = 0
+                window_bytes = 0
+                started_at = time.monotonic()
+                window_started_at = started_at
+                progressbar = tqdm(
+                    total=total_size or None,
+                    initial=resume_from if total_size else 0,
+                    desc="Downloading",
+                    ncols=70,
+                    unit_scale=True,
+                    unit="B",
+                )
+                try:
+                    with open(local_path, 'ab' if resume_from > 0 else 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=download_chunk_size):
+                            if chunk: # filter out keep-alive new chunks
+                                f.write(chunk)
+                                chunk_size = len(chunk)
+                                downloaded_bytes += chunk_size
+                                window_bytes += chunk_size
+                                progressbar.update(chunk_size)
+                                now = time.monotonic()
+                                if now - window_started_at >= LOW_SPEED_WINDOW_SECONDS:
+                                    speed = window_bytes / (now - window_started_at)
+                                    elapsed = now - started_at
+                                    if (
+                                        getattr(service, "web_download", False)
+                                        and elapsed >= LOW_SPEED_GRACE_SECONDS
+                                        and speed < LOW_SPEED_THRESHOLD_BYTES
+                                    ):
+                                        print(colored(
+                                            'Download speed too low ({}/s). Pausing and checking Fshare quota every 10 minutes.'.format(
+                                                service._bytes_to_traffic(speed),
+                                            ),
+                                            'yellow',
+                                        ))
+                                        if downloaded_bytes:
+                                            service.apply_download_traffic_usage(downloaded_bytes)
+                                        remaining_size = total_size - os.path.getsize(local_path) if total_size else 0
+                                        wait_for_download_traffic(remaining_size, force_wait=True)
+                                        break
+                                    window_bytes = 0
+                                    window_started_at = now
+                        else:
+                            if getattr(service, "web_download", False):
+                                service.apply_download_traffic_usage(downloaded_bytes)
+                                if service.download_traffic:
+                                    print(colored('Download traffic left: ', 'white'), colored(
+                                        '{} remaining'.format(service.download_traffic["remaining"]),
+                                        'yellow',
+                                    ))
+                            return (location + local_filename)
+                finally:
                     progressbar.close()
-            except HTTPError:
-                print("HTTP Error")
-        return (location + local_filename)
-    except Timeout:
-        print('Please check Internet connection, the request timed out')
-    except RequestException as e:
-        print('Download failed: {}'.format(e))
-        
-        
+                continue
+        except HTTPError:
+            print("HTTP Error")
+            return None
+        except Timeout:
+            print('Please check Internet connection, the request timed out')
+            return None
+        except RequestException as e:
+            print('Download failed: {}'.format(e))
+            return None
+
+def total_size_from_response(response, resume_from):
+    content_range = response.headers.get('content-range')
+    if content_range:
+        match = re.search(r'/(\d+)$', content_range)
+        if match:
+            return int(match.group(1))
+    content_length = int(response.headers.get('content-length') or 0)
+    return resume_from + content_length if resume_from else content_length
+
+def normalize_file_size(value):
+    if value in (None, ""):
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    value = str(value).strip()
+    if value.isdigit():
+        return int(value)
+    match = re.search(r'([\d.]+)\s*([KMGT]?B)', value, re.I)
+    if not match:
+        return 0
+    units = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
+    return int(float(match.group(1)) * units[match.group(2).upper()])
+
 def is_folder(url):
     if (url.find(Folder_Indicator)) != -1:
         return True
